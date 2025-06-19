@@ -1,0 +1,6 @@
+langchain
+python-dotenv
+loguru
+hdbcli
+mcp
+generative-ai-hub-sdk[all]
