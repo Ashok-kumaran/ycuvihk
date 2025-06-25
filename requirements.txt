@@ -1,6 +1,9 @@
-langchain
+# Core packages
 python-dotenv
-loguru
+fastapi
 hdbcli
-mcp
+langchain
 generative-ai-hub-sdk[all]
+mcp[stdio]
+httpx
+uvicorn

@@ -11,8 +11,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
 
+# === Load environment variables ===
 load_dotenv()
 
+# === SAP AI Core Configuration ===
 AICORE_CLIENT_ID = os.getenv("AICORE_CLIENT_ID")
 AICORE_AUTH_URL = os.getenv("AICORE_AUTH_URL")
 AICORE_CLIENT_SECRET = os.getenv("AICORE_CLIENT_SECRET")
@@ -41,8 +43,9 @@ class MCPClient:
         self.exit_stack = AsyncExitStack()
         self.tools = []
         self.memory = []
-        self.schema_text = ""
+        self.schema = {}
 
+    # === Connect to Server ===
     async def connect_to_server(self, server_script_path: str):
         is_python = server_script_path.endswith('.py')
         is_js = server_script_path.endswith('.js')
@@ -50,11 +53,7 @@ class MCPClient:
             raise ValueError("Server script must be a .py or .js file")
 
         command = "python" if is_python else "node"
-        server_params = StdioServerParameters(
-            command=command,
-            args=[server_script_path],
-            env=None
-        )
+        server_params = StdioServerParameters(command=command, args=[server_script_path], env=None)
 
         stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
         self.stdio, self.write = stdio_transport
@@ -62,60 +61,48 @@ class MCPClient:
 
         await self.session.initialize()
 
+        # List available tools
         response = await self.session.list_tools()
         self.tools = response.tools
         print("\n✅ Connected to server with tools:", [tool.name for tool in self.tools])
 
-        # Fetch schema for LLM prompt enrichment
-        try:
-            schema_result = await self.session.call_tool("get_schema", {})
-            if hasattr(schema_result, 'content') and schema_result.content:
-                for content in schema_result.content:
-                    if hasattr(content, 'text'):
-                        self.schema_text = content.text
-                        break
-        except Exception as e:
-            print(f"⚠️ Failed to fetch schema: {e}")
+        # Fetch table schema
+        await self.fetch_table_schema()
+
+    async def fetch_table_schema(self):
+        """Fetch schema from server and store valid columns per table."""
+        self.schema = {}
+        tool_result = await self.session.call_tool("get_schema", {})
+        if hasattr(tool_result, 'content') and tool_result.content:
+            for content in tool_result.content:
+                if hasattr(content, 'text'):
+                    try:
+                        schema_data = json.loads(content.text)
+                        if "schema" in schema_data:
+                            self.schema = schema_data["schema"]
+                            print("\n✅ Fetched schema for tables:", list(self.schema.keys()))
+                    except json.JSONDecodeError:
+                        print("⚠️ Failed to parse schema JSON.")
 
     async def process_query(self, query: str) -> str:
-        extracted_data = extract_fields(query)
-        if extracted_data:
-            formatted_data = "\n".join([f"{k}: {v}" for k, v in extracted_data.items()])
-            query = f"Add this data to the Customer table:\n{formatted_data}"
+        # Try to extract fields if it's an "add" operation
+        if "add this data" in query.lower() or "insert this data" in query.lower():
+            extracted_data = self.extract_fields(query)
+            if extracted_data:
+                valid_columns = []
+                if "Customer" in self.schema:
+                    valid_columns = [field["name"] for field in self.schema["Customer"]["fields"]]
 
-        def format_tool_params(tool):
-            if hasattr(tool, 'input_schema') and tool.input_schema and 'properties' in tool.input_schema:
-                params = [f'{name}: {prop.get("type", "any")}' for name, prop in tool.input_schema['properties'].items()]
-                return ', '.join(params)
-            elif hasattr(tool, 'parameters') and tool.parameters:
-                if isinstance(tool.parameters, list):
-                    params = [f'{param.name}: {param.type}' for param in tool.parameters if hasattr(param, 'name') and hasattr(param, 'type')]
-                    return ', '.join(params)
-            return ''
+                filtered_data = {k: v for k, v in extracted_data.items() if k in valid_columns}
 
-        tool_descriptions = "\n".join([
-            f"- {tool.name}({format_tool_params(tool)}): {tool.description}"
-            for tool in self.tools
-        ])
+                if not filtered_data:
+                    return "⚠️ None of the provided fields match the Customer table columns. Please check the input."
 
-        system_prompt = (
-            "You are a helpful assistant with access to database tools. Your primary purpose is to add new rows into the table. "
-            "You have access to the following tools:\n"
-            f"{tool_descriptions}\n\n"
-            f"Here is the current table schema for your reference:\n{self.schema_text}\n\n"
-            "IMPORTANT INSTRUCTIONS:\n"
-            "- When users ask to INSERT, ADD, CREATE data or row or record to a table/database, you MUST use the insert_data tool.\n"
-            "- When users ask about data counts, retrieving data, or querying information, use the get_data tool.\n"
-            "- When users ask about table structure or schema, use the get_schema tool.\n"
-            "- Default Schema: SAC_1\n"
-            "- Default Table: Customer\n"
-            "- When calling tools, ALWAYS use this exact format:\n"
-            "  TOOL: <tool_name>\n"
-            "  PARAMS: <JSON parameters>\n"
-            "- Never respond with JSON unless following the PARAMS format exactly.\n"
-            
-            "- Be concise, helpful, and avoid SQL examples.\n"
-        )
+                formatted_data = "\n".join([f"{k}: {v}" for k, v in filtered_data.items()])
+                query = f"Add this data to the Customer table:\n{formatted_data}"
+
+        # Prepare LLM system prompt
+        system_prompt = self.build_system_prompt()
 
         lc_messages = [SystemMessage(content=system_prompt)]
         lc_messages.extend(self.memory)
@@ -125,31 +112,15 @@ class MCPClient:
         llm_response = llm.invoke(lc_messages)
         response_text = llm_response.content
 
+        # Store memory
         self.memory.append(HumanMessage(content=query))
         self.memory.append(llm_response)
         MAX_MEMORY = 10
         if len(self.memory) > MAX_MEMORY * 2:
-            self.memory = self.memory[-MAX_MEMORY*2:]
+            self.memory = self.memory[-MAX_MEMORY * 2:]
 
-        if response_text.strip().startswith('{') and response_text.strip().endswith('}'):
-            try:
-                json_response = json.loads(response_text)
-                for key in ['response', 'answer', 'content', 'message']:
-                    if key in json_response:
-                        response_text = json_response[key]
-                        break
-            except json.JSONDecodeError:
-                pass
-
+        # Parse tool response
         tool_name, params = parse_tool_response(response_text)
-
-        # Handle plain tool call like "get_schema()"
-        if not tool_name:
-            tool_call_match = re.match(r"get_schema\s*\(\s*\)?", response_text.strip(), re.IGNORECASE)
-            if tool_call_match:
-                tool_name = "get_schema"
-                params = {"table": "Customer", "schema": "SAC_1"}
-
         if tool_name:
             if isinstance(params, dict):
                 params.setdefault('table', 'Customer')
@@ -161,7 +132,46 @@ class MCPClient:
         else:
             return response_text
 
+    def extract_fields(self, text: str) -> dict:
+        """Extract key-value pairs from concatenated field input."""
+        pattern = r'([A-Za-z0-9\s\-]+?):\s*(.*?)(?=[A-Za-z0-9\s\-]+?:|$)'
+        matches = re.findall(pattern, text)
+        extracted = {key.strip(): value.strip() for key, value in matches}
+        return extracted
+
+    def build_system_prompt(self) -> str:
+        """Construct the system prompt with tool descriptions."""
+        def format_tool_params(tool):
+            if hasattr(tool, 'input_schema') and tool.input_schema and 'properties' in tool.input_schema:
+                return ', '.join(f'{name}: {prop.get("type", "any")}' for name, prop in tool.input_schema['properties'].items())
+            elif hasattr(tool, 'parameters') and tool.parameters:
+                return ', '.join(f'{param.name}: {param.type}' for param in tool.parameters if hasattr(param, 'name') and hasattr(param, 'type'))
+            return ''
+
+        tool_descriptions = "\n".join([
+            f"- {tool.name}({format_tool_params(tool)}): {tool.description}" for tool in self.tools
+        ])
+
+        return (
+            "You are a helpful assistant with access to database tools. Your primary purpose is to add new rows into the table. "
+            "You have access to the following tools:\n"
+            f"{tool_descriptions}\n\n"
+            "IMPORTANT INSTRUCTIONS:\n"
+            "- When users ask to INSERT, ADD, CREATE data or row or record to a table/database, you MUST use the insert_data tool.\n"
+            "- When users ask about data counts, retrieving data, or querying information, use the get_data tool.\n"
+            "- When users ask about table structure or schema, use the get_schema tool.\n"
+            "- Default Schema: SAC_1\n"
+            "- Default Table: Customer\n"
+            "- Use tools ONLY in this exact format:\n"
+            "  TOOL: <tool_name>\n"
+            "  PARAMS: <JSON parameters>\n"
+            "- If no tool is needed, respond clearly in plain text.\n"
+            "- Never respond with raw JSON outside of PARAMS format.\n"
+            "- Be concise and human-like.\n"
+        )
+
     async def _process_tool_result(self, original_query: str, tool_name: str, tool_result) -> str:
+        """Process tool result into human-readable form."""
         result_text = ""
         if hasattr(tool_result, 'content') and tool_result.content:
             for content in tool_result.content:
@@ -177,16 +187,13 @@ class MCPClient:
         except json.JSONDecodeError:
             return f"Retrieved data: {result_text}"
 
+        llm = ChatOpenAI(deployment_id=LLM_DEPLOYMENT_ID)
         interpretation_prompt = (
             f"The user asked: \"{original_query}\"\n\n"
             f"The tool '{tool_name}' returned this data:\n{json.dumps(data, indent=2)}\n\n"
-            "Please provide a clear, direct answer to the user's question based on this data."
+            "Please provide a clear, direct answer to the user's question based on this data. Be concise and avoid technical details unless necessary."
         )
-
-        llm = ChatOpenAI(deployment_id=LLM_DEPLOYMENT_ID)
-        lc_messages = [HumanMessage(content=interpretation_prompt)]
-        interpretation_response = llm.invoke(lc_messages)
-
+        interpretation_response = llm.invoke([HumanMessage(content=interpretation_prompt)])
         return interpretation_response.content
 
     async def chat_loop(self):
@@ -196,15 +203,14 @@ class MCPClient:
                 query = input("\nQuery: ").strip()
                 if query.lower() in ('quit', 'exit'):
                     break
-
                 response = await self.process_query(query)
                 print("\n💬 Response:\n" + response)
-
             except Exception as e:
                 print(f"\n❌ Error: {str(e)}")
 
     async def cleanup(self):
         await self.exit_stack.aclose()
+
 
 async def main():
     if len(sys.argv) < 2:
